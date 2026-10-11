@@ -128,82 +128,267 @@ def generate_summary(article_text: str) -> str:
 FACTCHECK_MODEL = os.getenv("GEMINI_FACTCHECK_MODEL", GEMINI_MODEL)
 
 
-def search_google_news(claim: str, limit: int = 6) -> list:
-    """Retrieve public Google News RSS search results; this does not use paid Search grounding."""
-    cleaned_claim = re.sub(r"^[^:]{1,60}:\s*", "", claim.strip(), count=1)
-    words = re.findall(r"[A-Za-z][A-Za-z.-]{2,}", cleaned_claim)
+def build_fact_check_queries(claim: str, max_queries: int = 4) -> list:
+    """Turn a claim into short, broad search queries instead of searching a long sentence verbatim."""
+    text = str(claim or "").strip()
+
+    # Remove a short headline prefix such as "Hindi Signboard Row:" but do not
+    # remove a real location prefix such as "Tamil Nadu: ...".
+    if ":" in text:
+        prefix, remainder = text.split(":", 1)
+        prefix_words = prefix.strip().lower().split()
+        if len(prefix_words) <= 5 and any(
+            word in {"row", "headline", "breaking", "update", "claim"}
+            for word in prefix_words
+        ):
+            text = remainder.strip()
+
+    framing_patterns = [
+        r"^(?:a|the)\s+(?:viral|social\s+media|online)\s+(?:campaign|post|message|claim)\s+(?:falsely\s+)?claimed\s+that\s+",
+        r"^(?:it\s+is|it\s+was)\s+(?:falsely\s+)?claimed\s+that\s+",
+        r"^(?:the\s+)?(?:claim|statement|post)\s+(?:that|says?\s+that)\s+",
+        r"^(?:according\s+to\s+)?(?:a\s+)?viral\s+(?:post|message)\s+(?:that\s+)?",
+    ]
+    for pattern in framing_patterns:
+        text = re.sub(pattern, "", text, count=1, flags=re.IGNORECASE)
+    text = re.sub(r"\s+", " ", text).strip(" .,:;-")
+    lower_text = text.lower()
+
+    # Domain-specific synonyms make common public-policy claims searchable
+    # without forcing every word from a long claim into one query.
+    queries = []
+    if any(term in lower_text for term in ("beef", "cow slaughter", "cattle slaughter", "buffalo meat")):
+        region = "Tamil Nadu" if "tamil nadu" in lower_text else "India"
+        queries.extend([
+            f"{region} beef ban",
+            f"{region} beef sale law",
+            f"{region} beef ban fact check",
+            f"{region} animal preservation slaughter law",
+        ])
+
+    if any(term in lower_text for term in ("signboard", "signage", "lettering", "railway station board", "name board")):
+        region = "Tamil Nadu" if "tamil nadu" in lower_text or "thanjavur" in lower_text else "India"
+        queries.extend([
+            f"{region} Hindi signboard officials",
+            "Thanjavur railway station Hindi board removed",
+            "Stalin Hindi signboard highways officials",
+        ])
+
     stop_words = {
         "the", "and", "for", "with", "from", "after", "before", "over", "under",
         "into", "onto", "that", "this", "these", "those", "was", "were", "are",
         "has", "have", "had", "been", "being", "which", "what", "when", "where",
         "their", "there", "they", "them", "than", "then", "about", "claim", "news",
         "says", "said", "according", "allegedly", "reportedly", "leading", "following",
+        "viral", "campaign", "falsely", "claimed", "statement", "complete", "implemented",
+        "implement", "allegation", "rumour", "rumor", "post", "social", "media", "online",
+        "story", "article", "reported", "report", "government", "minister", "chief",
+        "official", "officials", "recently", "actually", "apparently", "supposedly",
+        "would", "could", "should", "will", "because", "while", "whose", "whom",
     }
-    keyword_words = []
-    seen_words = set()
-    for word in words:
-        lower = word.lower()
-        if lower in stop_words or lower in seen_words or len(lower) < 4:
+    terms = []
+    seen_terms = set()
+    for word in re.findall(r"[A-Za-z][A-Za-z'-]{2,}", text):
+        lowered = word.lower().strip("'-")
+        if lowered in stop_words or len(lowered) < 3 or lowered in seen_terms:
             continue
-        seen_words.add(lower)
-        keyword_words.append(word)
+        seen_terms.add(lowered)
+        terms.append(word.strip("'-"))
 
-    queries = []
-    full_query = cleaned_claim[:180].strip()
-    if full_query:
-        queries.append(full_query)
-    keyword_query = " ".join(keyword_words[:9]).strip()
-    if keyword_query and keyword_query.lower() != (full_query or "").lower():
-        queries.append(keyword_query)
+    # Preserve short entity phrases, then combine them with a few core terms.
+    entity_matches = re.findall(
+        r"\b(?:[A-Z][a-z]+|[A-Z]{2,})(?:[ .'-]+(?:[A-Z][a-z]+|[A-Z]{2,})){1,3}\b",
+        text,
+    )
+    entities = []
+    for entity in entity_matches:
+        entity = re.sub(r"\s+", " ", entity).strip()
+        if entity.lower() not in {"chief minister", "the tamil nadu", "the supreme court"} and entity not in entities:
+            entities.append(entity)
 
+    if terms:
+        queries.append(" ".join(terms[:5]))
+        queries.append(" ".join(terms[:7]))
+    entity_token_sets = [set(re.findall(r"[a-z]+", ent.lower())) for ent in entities[:3]]
+    for entity, entity_tokens in zip(entities[:3], entity_token_sets):
+        related_terms = [term for term in terms if term.lower() not in entity_tokens]
+        if related_terms:
+            queries.append(f"{entity} {' '.join(related_terms[:3])}")
+
+    # De-duplicate and avoid sending empty or excessively long queries.
+    unique = []
+    seen = set()
+    for query in queries:
+        query = re.sub(r"\s+", " ", query).strip(" .,:;-")
+        key = query.casefold()
+        if query and key not in seen and len(query) <= 100:
+            seen.add(key)
+            unique.append(query)
+        if len(unique) >= max_queries:
+            break
+    return unique
+
+
+def _parse_google_news_feed(content: bytes, limit: int) -> list:
+    """Parse RSS as XML (not HTML) and normalize Google News item fields."""
+    import xml.etree.ElementTree as ET
+
+    root = ET.fromstring(content)
+    results = []
+    for item in root.findall(".//item"):
+        title = (item.findtext("title") or "").strip()
+        url = (item.findtext("link") or "").strip()
+        if not title or not url:
+            continue
+        parsed_url = urlparse(url)
+        if parsed_url.scheme not in {"http", "https"}:
+            continue
+
+        source_element = item.find("source")
+        source_name = (source_element.text or "").strip() if source_element is not None else parsed_url.netloc
+        raw_description = item.findtext("description") or ""
+        raw_description = html.unescape(raw_description)
+        description = BeautifulSoup(raw_description, "html.parser").get_text(" ", strip=True)
+        published_at = (item.findtext("pubDate") or "").strip()
+        results.append({
+            "title": title[:500],
+            "source": (source_name or parsed_url.netloc)[:200],
+            "published_at": published_at[:100],
+            "snippet": description[:1200],
+            "url": url,
+        })
+        if len(results) >= limit:
+            break
+    return results
+
+
+def _generate_extra_search_queries(claim: str, existing_queries: list, max_queries: int = 3) -> list:
+    """Use Gemini only to suggest search terms when deterministic RSS searches are too narrow.
+
+    Gemini generates queries only; it is not allowed to issue a verdict without retrieved evidence.
+    """
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        return []
+    client = None
+    try:
+        client = genai.Client(api_key=api_key)
+        prompt = (
+            "Create 3 short web-news search queries to find reporting about the factual claim below. "
+            "Do not answer or fact-check the claim. Do not invent events. Keep each query 2-6 words, "
+            "preserve key people/places, and use reasonable synonyms. Return ONLY a JSON array of strings.\n\n"
+            f"CLAIM: {claim[:2000]}\n"
+            f"QUERIES ALREADY TRIED: {json.dumps(existing_queries, ensure_ascii=False)}"
+        )
+        response = client.models.generate_content(model=FACTCHECK_MODEL, contents=prompt)
+        raw = (getattr(response, "text", None) or "").strip()
+        raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.IGNORECASE).strip()
+        candidates = []
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, list):
+                candidates = parsed
+            elif isinstance(parsed, dict):
+                candidates = parsed.get("queries", [])
+        except (json.JSONDecodeError, TypeError, ValueError):
+            candidates = [line.strip(" -*\t\"'") for line in raw.splitlines()]
+        existing = {str(q).strip().casefold() for q in existing_queries}
+        output = []
+        for candidate in candidates:
+            if not isinstance(candidate, str):
+                continue
+            query = re.sub(r"\s+", " ", candidate).strip(" -*\t\"'")
+            if query and len(query) <= 100 and query.casefold() not in existing and query not in output:
+                output.append(query)
+            if len(output) >= max_queries:
+                break
+        return output
+    except Exception as error:
+        print(f"Gemini search-query suggestion failed: {error}")
+        return []
+    finally:
+        if client is not None:
+            client.close()
+
+
+def search_google_news(claim: str, limit: int = 6) -> dict:
+    """Search Google News RSS with short queries, XML parsing, and locale fallbacks.
+
+    RSS is a public, undocumented feed convention, so it can be incomplete or unavailable.
+    The caller must never treat an empty feed as proof that a claim is true or false.
+    """
+    queries = build_fact_check_queries(claim, max_queries=4)
+    queries_tried = []
     results = []
     seen_urls = set()
-    for query in queries[:2]:
+    successful_feeds = 0
+    feed_failures = []
+    locales = [
+        {"hl": "en-IN", "gl": "IN", "ceid": "IN:en"},
+        {"hl": "en-US", "gl": "US", "ceid": "US:en"},
+    ]
+
+    def fetch_query(query: str, locale: dict):
+        nonlocal successful_feeds
+        queries_tried.append(query)
         try:
             response = requests.get(
                 "https://news.google.com/rss/search",
-                params={"q": query, "hl": "en-IN", "gl": "IN", "ceid": "IN:en"},
-                headers={"User-Agent": "Mozilla/5.0 FactShieldAI/1.0"},
-                timeout=8,
+                params={"q": query, **locale},
+                headers={
+                    "User-Agent": "Mozilla/5.0 (compatible; FactShieldAI/1.1; +https://fact-shield-ai-4tf2.vercel.app)"
+                },
+                timeout=6,
             )
             response.raise_for_status()
-            feed = BeautifulSoup(response.content, "html.parser")
-            for item in feed.find_all("item"):
-                title_tag = item.find("title")
-                link_tag = item.find("link")
-                if not title_tag or not link_tag:
+            parsed_items = _parse_google_news_feed(response.content, limit=limit)
+            successful_feeds += 1
+            added = 0
+            for item in parsed_items:
+                key = item["url"].split("?", 1)[0].rstrip("/").casefold()
+                title_key = item["title"].casefold()
+                if key in seen_urls or not key:
                     continue
-                title = title_tag.get_text(" ", strip=True)
-                url = link_tag.get_text(" ", strip=True)
-                if not url or url in seen_urls:
+                # Avoid duplicate headlines that use different tracking URLs.
+                if any(existing.get("title", "").casefold() == title_key for existing in results):
                     continue
-                parsed_url = urlparse(url)
-                if parsed_url.scheme not in {"http", "https"}:
-                    continue
-                seen_urls.add(url)
-
-                source_tag = item.find("source")
-                source_name = source_tag.get_text(" ", strip=True) if source_tag else parsed_url.netloc
-                description_tag = item.find("description")
-                description = ""
-                if description_tag:
-                    raw_description = html.unescape(description_tag.get_text(" ", strip=True))
-                    description = BeautifulSoup(raw_description, "html.parser").get_text(" ", strip=True)
-                date_tag = item.find("pubdate") or item.find("pubDate")
-                published_at = date_tag.get_text(" ", strip=True) if date_tag else ""
-
-                results.append({
-                    "title": title[:500],
-                    "source": source_name[:200],
-                    "published_at": published_at[:100],
-                    "snippet": description[:1200],
-                    "url": url,
-                })
+                seen_urls.add(key)
+                results.append(item)
+                added += 1
                 if len(results) >= limit:
-                    return results
+                    break
+            return added
         except Exception as error:
-            print(f"Google News RSS lookup failed for query {query!r}: {error}")
-    return results
+            feed_failures.append(f"{query} [{locale['gl']}]: {type(error).__name__}")
+            print(f"Google News RSS lookup failed for query {query!r} ({locale['gl']}): {error}")
+            return 0
+
+    # First try short deterministic queries; use a second edition for each to broaden coverage.
+    for query in queries:
+        fetch_query(query, locales[0])
+        if len(results) < min(limit, 3):
+            fetch_query(query, locales[1])
+        if len(results) >= limit:
+            break
+
+    # If the feed responded but the initial queries were still too narrow, ask Gemini only
+    # for better search terms, then search those terms. No verdict is produced from memory.
+    if len(results) < min(limit, 3) and successful_feeds > 0:
+        extra_queries = _generate_extra_search_queries(claim, queries_tried, max_queries=3)
+        for query in extra_queries:
+            fetch_query(query, locales[0])
+            if len(results) < min(limit, 3):
+                fetch_query(query, locales[1])
+            if len(results) >= limit:
+                break
+
+    return {
+        "sources": results[:limit],
+        "queries_tried": list(dict.fromkeys(queries_tried)),
+        "feed_available": successful_feeds > 0,
+        "feed_requests_succeeded": successful_feeds,
+        "feed_errors": feed_failures[:5],
+    }
 
 
 def generate_fact_check(claim: str) -> dict:
@@ -216,15 +401,24 @@ def generate_fact_check(claim: str) -> dict:
         )
 
     bounded_claim = claim.strip()[:8000]
-    sources = search_google_news(bounded_claim, limit=6)
+    search_result = search_google_news(bounded_claim, limit=6)
+    sources = search_result["sources"]
     if not sources:
+        feed_available = search_result["feed_available"]
         return {
             "claim": bounded_claim,
             "verdict": "UNVERIFIED",
-            "headline": "No matching news results found",
-            "explanation": "The public news feed did not return usable results for this claim. This does not prove the claim is true or false. Try a shorter claim or review trusted sources manually.",
+            "headline": "No matching news results found" if feed_available else "News search temporarily unavailable",
+            "explanation": (
+                "The public news feed responded, but these queries did not return usable articles for this claim. "
+                "That does not prove the claim is true or false. Try a shorter claim or different keywords, and review trusted sources manually."
+                if feed_available else
+                "FactShield could not retrieve or parse the public news feed right now. That does not prove the claim is true or false. Please retry later or review trusted sources manually."
+            ),
             "key_findings": [],
             "sources": [],
+            "search_queries": search_result["queries_tried"],
+            "search_status": "NO_MATCHES" if feed_available else "SEARCH_UNAVAILABLE",
             "grounded": False,
             "checked_at": datetime.now(timezone.utc).isoformat(),
             "note": "This is an AI-assisted preliminary assessment, not an official fact-check verdict.",
@@ -301,6 +495,8 @@ RETRIEVED NEWS RESULTS:
             "explanation": explanation,
             "key_findings": findings,
             "sources": sources,
+            "search_queries": search_result["queries_tried"],
+            "search_status": "RESULTS_FOUND",
             "grounded": bool(sources),
             "checked_at": datetime.now(timezone.utc).isoformat(),
             "note": "This is an AI-assisted preliminary assessment based on news search results, not an official fact-check verdict. Open the sources and verify their full context.",

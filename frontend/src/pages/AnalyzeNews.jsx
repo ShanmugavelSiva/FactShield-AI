@@ -152,17 +152,37 @@ function FactCheckResult({ result }) {
           <div className="mt-5">
             <p className="text-sm font-semibold">News sources found by Google News RSS</p>
             {sources.length > 0 ? (
-              <ul className="mt-2 space-y-2">
+              <ul className="mt-2 space-y-3">
                 {sources.map((source, index) => (
-                  <li key={source.url || index}>
-                    <a href={source.url} target="_blank" rel="noreferrer" className="inline-flex max-w-full items-center gap-2 break-all text-sm font-medium text-brand-700 underline dark:text-brand-300">
-                      <span>{source.title || source.url}</span><ExternalLink className="h-3.5 w-3.5 shrink-0" />
+                  <li key={source.url || index} className="rounded-lg border border-slate-200 p-3 dark:border-slate-700">
+                    <a href={source.url} target="_blank" rel="noreferrer" className="inline-flex max-w-full items-start gap-2 break-words text-sm font-semibold text-brand-700 underline dark:text-brand-300">
+                      <span>{source.title || source.url}</span><ExternalLink className="mt-0.5 h-3.5 w-3.5 shrink-0" />
                     </a>
+                    {(source.source || source.published_at) && (
+                      <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">
+                        {[source.source, source.published_at].filter(Boolean).join(' · ')}
+                      </p>
+                    )}
+                    {source.snippet && <p className="mt-2 text-sm leading-5 text-slate-600 dark:text-slate-300">{source.snippet}</p>}
                   </li>
                 ))}
               </ul>
             ) : (
-              <p className="mt-2 text-sm text-slate-600 dark:text-slate-300">No news source links were returned. Treat this as unverified and retry later.</p>
+              <p className="mt-2 text-sm text-slate-600 dark:text-slate-300">
+                {result?.search_status === 'SEARCH_UNAVAILABLE'
+                  ? 'The news feed could not be reached or parsed. This is a search-service issue, not a verdict on the claim.'
+                  : 'No usable news source links were found for the search queries tried. This does not prove the claim is true or false.'}
+              </p>
+            )}
+            {Array.isArray(result?.search_queries) && result.search_queries.length > 0 && (
+              <div className="mt-4">
+                <p className="text-xs font-semibold text-slate-500 dark:text-slate-400">Search queries tried</p>
+                <div className="mt-2 flex flex-wrap gap-2">
+                  {result.search_queries.map((query, index) => (
+                    <span key={`${index}-${query}`} className="rounded-full bg-slate-100 px-3 py-1 text-xs text-slate-700 dark:bg-slate-800 dark:text-slate-200">{query}</span>
+                  ))}
+                </div>
+              </div>
             )}
           </div>
           <p className="mt-4 text-xs text-slate-500 dark:text-slate-400">AI-assisted assessment only. This preliminary assessment uses Google News RSS results, which may be incomplete. Open the sources and check full article context; it is not an official fact-check verdict.</p>
