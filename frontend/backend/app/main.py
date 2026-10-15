@@ -120,7 +120,6 @@ FACTCHECK_MODEL = os.getenv("GEMINI_FACTCHECK_MODEL", GEMINI_MODEL)
 def build_fact_check_queries(claim: str, max_queries: int = 6) -> list:
     """Build diverse, time-aware search queries without treating model memory as evidence."""
     text = str(claim or "").strip()
-
     # Remove an editorial prefix but retain real place names.
     if ":" in text:
         prefix, remainder = text.split(":", 1)
@@ -130,7 +129,6 @@ def build_fact_check_queries(claim: str, max_queries: int = 6) -> list:
             for word in prefix_words
         ):
             text = remainder.strip()
-
     framing_patterns = [
         r"^(?:a|the)\s+(?:viral|social\s+media|online)\s+(?:campaign|post|message|claim)\s+(?:falsely\s+)?claimed\s+that\s+",
         r"^(?:it\s+is|it\s+was)\s+(?:falsely\s+)?claimed\s+that\s+",
@@ -139,12 +137,10 @@ def build_fact_check_queries(claim: str, max_queries: int = 6) -> list:
     ]
     for pattern in framing_patterns:
         text = re.sub(pattern, "", text, count=1, flags=re.IGNORECASE)
-
     text = re.sub(r"\s+", " ", text).strip(" .,:;-")
     lower_text = text.lower()
     queries = []
     after_date = (datetime.now(timezone.utc).date() - timedelta(days=365)).isoformat()
-
     # Search both the headline claim and the latest legal/policy status.
     # The date operator helps surface newer developments that may supersede older reports.
     if any(term in lower_text for term in ("beef", "cow slaughter", "cattle slaughter", "buffalo meat", "beef meat")):
@@ -157,7 +153,6 @@ def build_fact_check_queries(claim: str, max_queries: int = 6) -> list:
             f'"{region}" beef ban legal status',
             f'"{region}" beef sale law',
         ])
-
     if any(term in lower_text for term in ("signboard", "signage", "lettering", "railway station board", "name board")):
         region = "Tamil Nadu" if "tamil nadu" in lower_text or "thanjavur" in lower_text else "India"
         queries.extend([
@@ -166,7 +161,6 @@ def build_fact_check_queries(claim: str, max_queries: int = 6) -> list:
             'Stalin Hindi signboard highways officials',
             'Tamil Nadu Hindi signage controversy official clarification',
         ])
-
     stop_words = {
         "the", "and", "for", "with", "from", "after", "before", "over", "under",
         "into", "onto", "that", "this", "these", "those", "was", "were", "are",
@@ -187,11 +181,9 @@ def build_fact_check_queries(claim: str, max_queries: int = 6) -> list:
             continue
         seen_terms.add(lowered)
         terms.append(word.strip("'-"))
-
     if terms:
         # A concise, claim-specific fallback query.
         queries.append(" ".join(terms[:6]))
-
     entity_matches = re.findall(
         r"\b(?:[A-Z][a-z]+|[A-Z]{2,})(?:[ .'-]+(?:[A-Z][a-z]+|[A-Z]{2,})){1,3}\b",
         text,
@@ -206,7 +198,6 @@ def build_fact_check_queries(claim: str, max_queries: int = 6) -> list:
         related_terms = [term for term in terms if term.lower() not in entity_words]
         if related_terms:
             queries.append(f"{entity} {' '.join(related_terms[:4])}")
-
     unique = []
     seen = set()
     for query in queries:
@@ -218,7 +209,6 @@ def build_fact_check_queries(claim: str, max_queries: int = 6) -> list:
         if len(unique) >= max(1, max_queries):
             break
     return unique
-
 def _parse_google_news_feed(content: bytes, limit: int) -> list:
     """Parse RSS as XML (not HTML) and normalize Google News item fields."""
     import xml.etree.ElementTree as ET
@@ -296,7 +286,6 @@ def _generate_extra_search_queries(claim: str, existing_queries: list, max_queri
             client.close()
 def search_google_news(claim: str, limit: int = 6) -> dict:
     """Search several distinct Google News RSS queries and retain source/date metadata.
-
     RSS results are incomplete and do not prove a claim true or false. Multiple queries
     are intentionally attempted even when the first query returns many headlines.
     """
@@ -311,7 +300,6 @@ def search_google_news(claim: str, limit: int = 6) -> dict:
         {"hl": "en-IN", "gl": "IN", "ceid": "IN:en"},
         {"hl": "en-US", "gl": "US", "ceid": "US:en"},
     ]
-
     def fetch_query(query: str, locale: dict, source_quota: int = 2) -> int:
         nonlocal successful_feeds
         if query not in queries_tried:
@@ -346,7 +334,6 @@ def search_google_news(claim: str, limit: int = 6) -> dict:
             feed_failures.append(f"{query} [{locale['gl']}]: {type(error).__name__}")
             print(f"Google News RSS lookup failed for query {query!r} ({locale['gl']}): {error}")
             return 0
-
     # Ensure a minimum of three different queries are attempted; cap at six to
     # control latency. Limit contributions per query so one broad search cannot
     # crowd out newer legal-status or fact-checking coverage.
@@ -358,7 +345,6 @@ def search_google_news(claim: str, limit: int = 6) -> dict:
             fetch_query(query, locales[1], source_quota=2)
         if index >= 2 and len(results) >= limit:
             break
-
     # If the initial feed searches yielded too few sources, request extra query
     # ideas only; Gemini is not permitted to issue a memory-based verdict.
     if len(results) < min(limit, 3) and successful_feeds > 0:
@@ -369,7 +355,6 @@ def search_google_news(claim: str, limit: int = 6) -> dict:
                 fetch_query(query, locales[1], source_quota=2)
             if len(results) >= limit:
                 break
-
     return {
         "sources": results[:limit],
         "queries_tried": queries_tried,
@@ -377,7 +362,6 @@ def search_google_news(claim: str, limit: int = 6) -> dict:
         "feed_requests_succeeded": successful_feeds,
         "feed_errors": feed_failures[:5],
     }
-
 def generate_fact_check(claim: str) -> dict:
     """Use public news RSS results as evidence, then ask Gemini to assess the claim cautiously."""
     api_key = os.getenv("GEMINI_API_KEY")
@@ -648,7 +632,7 @@ def extract_article_from_html(html: str):
             " ",
             strip=True
         )
-    # Prefer \<article>
+    # Prefer \\\<article>
     article = soup.find("article")
     if article:
         article_text = article.get_text(
@@ -798,6 +782,24 @@ def run_prediction(news_text: str):
             "explanation": (
                 "The submitted text does not contain enough "
                 "usable text."
+            ),
+            "keywords": []
+        }
+    # Avoid misleading fake/real labels for short claims. The model was
+    # trained on longer news articles, so short statements should be
+    # checked separately against sources.
+    word_count = len(cleaned_text.split())
+    if word_count < 30:
+        return {
+            "prediction": "UNKNOWN",
+            "confidence": 0.0,
+            "fake_probability": 0.0,
+            "real_probability": 0.0,
+            "explanation": (
+                f"Only {word_count} words were provided. "
+                "This ML model is designed for longer news "
+                "articles and cannot reliably classify short claims. "
+                "Use source-based fact-checking to verify this claim."
             ),
             "keywords": []
         }
